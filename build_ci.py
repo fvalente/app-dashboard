@@ -215,6 +215,30 @@ def repo_week_heatmap(rows, weekset):
             f'<div style="font-size:11px;color:{MUTE};margin-top:2px">Each cell = one ISO week &middot; peak {mx} commits/week</div>'
             + legend())
 
+def repo_day_heatmap(rows, days):
+    """rows: list of (name, {day:count}). One row per repo, one cell per calendar day."""
+    if not rows:
+        return '<div style="padding:10px 0;color:#889;font-size:13px">No activity in this window.</div>'
+    mx = max((c for _, dd in rows for c in dd.values()), default=0)
+    head = ['<td style="width:150px"></td>']
+    for ds in days:
+        dt = datetime.strptime(ds, "%Y-%m-%d")
+        lab = str(dt.day) if dt.weekday() == 0 else ""   # label Mondays
+        head.append(f'<td style="font-size:9px;color:{MUTE};text-align:center">{lab}</td>')
+    body = ['<tr style="height:14px">' + "".join(head) + '</tr>']
+    for name, dd in rows:
+        cells = [f'<td style="width:150px;font-size:12px;color:{INK};white-space:nowrap;padding-right:6px">{esc(name)}</td>']
+        for ds in days:
+            c = dd.get(ds, 0)
+            t = f' title="{ds}: {c}"' if c else ""
+            cells.append(f'<td bgcolor="{shade(c, mx)}"{t}></td>')
+        body.append('<tr style="height:13px">' + "".join(cells) + '</tr>')
+    return ('<table role="presentation" cellpadding="0" cellspacing="1" border="0" bgcolor="#ffffff" '
+            'style="width:100%;border-collapse:separate;table-layout:fixed">'
+            + "".join(body) + '</table>'
+            f'<div style="font-size:11px;color:{MUTE};margin-top:2px">Each cell = one day &middot; peak {mx} commits/day</div>'
+            + legend())
+
 def punch_card(punch):
     """punch: dict {(dow1-7, hour0-23): count}. 7 rows x 24 cols heatmap."""
     mx = max(punch.values(), default=0)
@@ -273,14 +297,14 @@ def insights_block(events, repos_window):
     chips = [
         chip(f"{peak_hr:02d}:00", "Peak hour"),
         chip(DOW[peak_dw-1], "Most active day"),
-        chip(f"{round(night/n*100)}%", "Commits 6pm&ndash;6am (night owl)"),
+        chip(f"{round(night/n*100)}%", "Commits 6pm–6am (night owl)"),
         chip(f"{round(weekend/n*100)}%", "Weekend commits"),
         chip(f"{streak} days", "Longest daily streak"),
         chip(f"{busiest_week}", "Busiest week (commits)"),
     ]
-    if top_repo: chips.append(chip(top_repo[0], f"Top repo &middot; {fmt(top_repo[1])} commits"))
+    if top_repo: chips.append(chip(top_repo[0], f"Top repo · {fmt(top_repo[1])} commits"))
     if top_churn and (not top_repo or top_churn[0] != top_repo[0]):
-        chips.append(chip(top_churn[0], f"Most churn &middot; {fmt(top_churn[2])} lines"))
+        chips.append(chip(top_churn[0], f"Most churn · {fmt(top_churn[2])} lines"))
     rows = ""
     for i in range(0, len(chips), 3):
         rows += ('<tr>' + "".join(chips[i:i+3])
@@ -327,9 +351,9 @@ def work_patterns(repos, today):
         f'<h2 style="margin:30px 0 2px;font-size:19px;color:{NAVY}">Work patterns</h2>',
         f'<div style="font-size:12px;color:{MUTE};margin-bottom:12px">Based on the last 12 months &middot; times are each commit&rsquo;s local timezone.</div>',
         panel("Insights", "last 12 months", insights_block(agg, repos_window)),
-        panel("When you commit", "weekday &times; hour-of-day", punch_card(punch))])
+        panel("When you commit", "weekday × hour-of-day", punch_card(punch))])
 
-def section(title, win_start, win_end, color, repos, with_heatmap):
+def section(title, win_start, win_end, color, repos, heatmap=None, show_table=False):
     weekset = weeks_in(win_start, win_end)
     wkset = set(weekset)
     ws = win_start.date().isoformat()
@@ -362,31 +386,43 @@ def section(title, win_start, win_end, color, repos, with_heatmap):
          f'Window {win_start.date().isoformat()} &rarr; {win_end.date().isoformat()}. '
          'Commit counts here are for this window; the table shows lifetime totals.</div>',
          cards]
-    if with_heatmap:
+    if heatmap == "weekly":
         hm_rows = []
         for m, _, ev in by_commits:
             wk = {}
             for _, w, _, _ in ev:
                 if w in wkset: wk[w] = wk.get(w, 0) + 1
             hm_rows.append((m["name"], wk))
-        s.append(panel("Weekly activity by repo", "each repo&rsquo;s rhythm over the window",
+        s.append(panel("Weekly activity by repo", "each repo’s rhythm over the window",
                        repo_week_heatmap(hm_rows, weekset)))
+    elif heatmap == "daily":
+        days = [(win_start + timedelta(days=i)).date().isoformat()
+                for i in range((win_end - win_start).days + 1)]
+        dayset = set(days)
+        hm_rows = []
+        for m, _, ev in by_commits:
+            dd = {}
+            for day, _, _, _ in ev:
+                if day in dayset: dd[day] = dd.get(day, 0) + 1
+            hm_rows.append((m["name"], dd))
+        s.append(panel("Daily activity by repo", "each repo’s commits per day",
+                       repo_day_heatmap(hm_rows, days)))
     else:
-        s.append(panel("Timeline", "bar = first&rarr;latest commit (clamped to window), number = commits",
+        s.append(panel("Timeline", "bar = first→latest commit (clamped to window), number = commits",
                        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse">'
                        + gantt_rows(gantt_data, win_start, win_end, color) + '</table>'))
     s.append(panel("Commits per app", "in this window",
                    '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse">'
                    + hbar_rows(bar_data, color) + '</table>'))
-    if with_heatmap:
+    if show_table:
         s.append(panel("Repos", "lifetime totals", table_block([m for m, _, _ in by_commits])))
     return "".join(s)
 
 def render_html(repos, now_str, today=None):
     if today is None: today = datetime.utcnow()
     wp   = work_patterns(repos, today)
-    s30  = section("Last 30 days",  today - timedelta(days=30),  today, NAVY, repos, with_heatmap=False)
-    s365 = section("Last 12 months", today - timedelta(days=365), today, TEAL, repos, with_heatmap=True)
+    s30  = section("Last 30 days",  today - timedelta(days=30),  today, NAVY, repos, heatmap="daily", show_table=False)
+    s365 = section("Last 12 months", today - timedelta(days=365), today, TEAL, repos, heatmap="weekly", show_table=True)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
