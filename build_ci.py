@@ -6,6 +6,17 @@ computes activity metrics from git history, and writes a self-contained
 output/dashboard.html (+ output/data.csv). Delivery (email / private repo push)
 is handled by the workflow, not this script.
 
+The HTML is e-mail-safe: no JavaScript, no <svg>, no base64 images. Charts are
+drawn with plain inline-styled HTML tables so they render inside Gmail (which
+strips scripts, data: images and inline SVG). The table rows are pre-rendered
+server-side for the same reason.
+
+Two windows are shown: the last 30 days first, then the last 12 months. The
+all-time view was dropped because the oldest repo (2014) stretched the axis so
+far that recent activity was unreadable. Commit counts shown in the cards,
+charts and timeline numbers are *windowed* (summed from the per-repo weekly
+commit buckets); the repo table keeps lifetime totals so it matches data.csv.
+
 Privacy: prints ONLY aggregate counts to stdout — never repo names — because
 public-repo Actions logs are world-readable.
 
@@ -15,7 +26,7 @@ Env:
   EXTRA_REPOS(optional)  comma-separated owner/name to also include (e.g. collaborator repos)
   EXCLUDE_REPOS(optional) comma-separated owner/name to skip
 """
-import os, sys, json, subprocess, tempfile, shutil, base64, io, csv, urllib.request
+import os, sys, json, subprocess, tempfile, shutil, csv, html, urllib.request
 from datetime import datetime, timedelta
 
 API = "https://api.github.com"
@@ -87,64 +98,200 @@ def metrics(full, repo):
             "active_days": len(days), "insertions": ins, "deletions": dele,
             "churn": ins+dele, "weekly": weekly}
 
-def render(repos):
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt, matplotlib.dates as mdates, numpy as np
-    from matplotlib.cm import ScalarMappable; from matplotlib.colors import Normalize
-    def d(s): return datetime.strptime(s,"%Y-%m-%d")
-    names=[m["name"] for m in repos]; starts=[d(m["first"]) for m in repos]
-    lasts=[d(m["last"]) for m in repos]; commits=[m["commits"] for m in repos]
-    norm=Normalize(min(commits),max(commits)); cmap=plt.cm.viridis
-    colors=[cmap(norm(c)) for c in commits]
-    # timeline
-    f1,ax=plt.subplots(figsize=(12,0.45*len(repos)+1.5))
-    y=list(range(len(repos)))[::-1]
-    for yi,s,l,c,col in zip(y,starts,lasts,commits,colors):
-        if (l-s).days<3: ax.plot(mdates.date2num(s),yi,"o",color=col,ms=10,mec="#333",mew=.6)
-        else: ax.barh(yi,l-s,left=s,height=.6,color=col,ec="#333",lw=.6)
-        ax.text(mdates.date2num(l)+4,yi,str(c),va="center",fontsize=9,fontweight="bold")
-    ax.set_yticks(y); ax.set_yticklabels(names,fontsize=10)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
-    ax.grid(axis="x",color="#eee"); ax.set_axisbelow(True)
-    for sp in ["top","right"]: ax.spines[sp].set_visible(False)
-    ax.set_title("Timeline — bar = first→latest commit, number = commits",loc="left",fontsize=12,fontweight="bold")
-    b1=io.BytesIO(); f1.savefig(b1,format="png",dpi=140,bbox_inches="tight",facecolor="white"); plt.close(f1)
-    # weekly heatmap
-    def mon(w): return datetime.strptime(w+"-1","%G-%V-%u")
-    allw=set()
-    for m in repos: allw|=set(m["weekly"].keys())
-    heat=""
-    if allw:
-        wmin=min(mon(w) for w in allw); wmax=max(mon(w) for w in allw)
-        mondays=[]; dd=wmin
-        while dd<=wmax: mondays.append(dd); dd+=timedelta(days=7)
-        lk=[mm.strftime("%G-%V") for mm in mondays]
-        M=np.zeros((len(repos),len(mondays)))
-        for i,m in enumerate(repos):
-            for w,c in m["weekly"].items():
-                if w in lk: M[i,lk.index(w)]=c
-        f2,ax2=plt.subplots(figsize=(max(12,len(mondays)*0.26),0.42*len(repos)+1.5))
-        masked=np.ma.masked_where(M==0,M); cm=plt.cm.YlGnBu.copy(); cm.set_bad("#f7f7f7")
-        im=ax2.imshow(masked,aspect="auto",cmap=cm,vmin=1,vmax=max(M.max(),1))
-        for i in range(M.shape[0]):
-            for j in range(M.shape[1]):
-                if M[i,j]>0: ax2.text(j,i,int(M[i,j]),ha="center",va="center",fontsize=7,
-                                      color="white" if M[i,j]>M.max()*.55 else "#222")
-        ax2.set_yticks(range(len(names))); ax2.set_yticklabels(names,fontsize=9.5)
-        xt=[];xl=[];lastk=None
-        for j,mm in enumerate(mondays):
-            k=(mm.year,mm.month)
-            if k!=lastk: xt.append(j);xl.append(mm.strftime("%b\n%Y"));lastk=k
-        ax2.set_xticks(xt); ax2.set_xticklabels(xl,fontsize=8)
-        ax2.set_xticks(np.arange(-.5,len(mondays),1),minor=True)
-        ax2.set_yticks(np.arange(-.5,len(names),1),minor=True)
-        ax2.grid(which="minor",color="white",lw=1.2); ax2.tick_params(which="minor",length=0)
-        for sp in ax2.spines.values(): sp.set_visible(False)
-        ax2.set_title("Weekly commits per app (blank = no activity)",loc="left",fontsize=12,fontweight="bold")
-        b2=io.BytesIO(); f2.savefig(b2,format="png",dpi=130,bbox_inches="tight",facecolor="white"); plt.close(f2)
-        heat=base64.b64encode(b2.getvalue()).decode()
-    return base64.b64encode(b1.getvalue()).decode(), heat
+# --------------------------------------------------------------------------
+#  E-mail-safe HTML rendering (no JS, no base64, no SVG; inline styles only)
+# --------------------------------------------------------------------------
+NAVY="#1f3864"; TEAL="#2c7fb8"; INK="#1a2233"; MUTE="#667"; LINE="#e7eaf1"
+AXIS=80.0  # % of a bar track used by bars; remainder reserved for the number label
+
+def esc(s): return html.escape(str(s))
+def fmt(n): return f"{n:,}"
+def d(s):   return datetime.strptime(s, "%Y-%m-%d")
+def week_monday(w): return datetime.strptime(w+"-1", "%G-%V-%u")  # "%G-%V" -> that week's Monday
+
+def weeks_in(start, end):
+    """Ordered list of ISO 'year-week' keys for every Monday in [start, end]."""
+    dd = start - timedelta(days=start.weekday())   # back up to Monday
+    out = []
+    while dd <= end:
+        out.append(dd.strftime("%G-%V")); dd += timedelta(days=7)
+    return out
+
+def win_commits(m, weekset):
+    return sum(m["weekly"].get(w, 0) for w in weekset)
+
+def card(value, label, sub=""):
+    subhtml = f'<div style="font-size:11px;color:{MUTE};margin-top:2px">{esc(sub)}</div>' if sub else ""
+    return ('<td style="background:#ffffff;border:1px solid '+LINE+';border-radius:10px;padding:12px 14px;vertical-align:top">'
+            f'<div style="font-size:24px;font-weight:700;color:{NAVY};line-height:1.1">{esc(value)}</div>'
+            f'<div style="font-size:11px;color:{MUTE};text-transform:uppercase;letter-spacing:.04em;margin-top:4px">{esc(label)}</div>'
+            f'{subhtml}</td>')
+
+def panel(title, sub, inner):
+    subhtml = f' <span style="font-weight:400;color:{MUTE};font-size:12px">&middot; {esc(sub)}</span>' if sub else ""
+    return ('<div style="background:#ffffff;border:1px solid '+LINE+';border-radius:10px;padding:14px 18px;margin:14px 0">'
+            f'<div style="font-size:14px;font-weight:600;color:{INK};margin-bottom:10px">{esc(title)}{subhtml}</div>'
+            f'{inner}</div>')
+
+def hbar_rows(items, color):
+    """items: list of (label, value). Horizontal bar, length proportional to value."""
+    if not items:
+        return '<tr><td style="padding:10px 0;color:#889;font-size:13px">No activity in this window.</td></tr>'
+    mx = max(v for _, v in items) or 1
+    out = []
+    for label, v in items:
+        pct  = max(v / mx * AXIS, 1.2)
+        rest = max(100 - pct, 0.1)
+        out.append('<tr>'
+            f'<td style="width:160px;font-size:13px;color:{INK};padding:5px 10px 5px 0;text-align:left;vertical-align:middle;white-space:nowrap">{esc(label)}</td>'
+            '<td style="padding:5px 0;vertical-align:middle">'
+            '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse"><tr>'
+            f'<td width="{pct:.2f}%" style="width:{pct:.2f}%"><div style="background:{color};height:16px;border-radius:3px;font-size:0;line-height:16px">&nbsp;</div></td>'
+            f'<td width="{rest:.2f}%" style="padding-left:8px;font-size:12px;color:{MUTE};white-space:nowrap;text-align:left">{fmt(v)}</td>'
+            '</tr></table></td></tr>')
+    return "".join(out)
+
+def gantt_rows(rows, win_start, win_end, color):
+    """rows: list of (label, first_date, last_date, number). Bar = first->last clamped to window."""
+    if not rows:
+        return '<tr><td style="padding:10px 0;color:#889;font-size:13px">No activity in this window.</td></tr>'
+    span = (win_end - win_start).days or 1
+    out = []
+    for label, fdt, ldt, num in rows:
+        f = max(fdt, win_start); l = min(ldt, win_end)
+        off = max((f - win_start).days, 0) / span * AXIS
+        dur = max((l - f).days / span * AXIS, 1.2)
+        if off + dur > AXIS: dur = max(AXIS - off, 1.2)
+        rest = max(100 - off - dur, 0.1)
+        out.append('<tr>'
+            f'<td style="width:160px;font-size:13px;color:{INK};padding:5px 10px 5px 0;text-align:left;vertical-align:middle;white-space:nowrap">{esc(label)}</td>'
+            '<td style="padding:5px 0;vertical-align:middle">'
+            '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse"><tr>'
+            f'<td width="{off:.2f}%" style="width:{off:.2f}%;font-size:0">&nbsp;</td>'
+            f'<td width="{dur:.2f}%" style="width:{dur:.2f}%"><div style="background:{color};height:16px;border-radius:3px;font-size:0;line-height:16px">&nbsp;</div></td>'
+            f'<td width="{rest:.2f}%" style="padding-left:8px;font-size:12px;color:{MUTE};white-space:nowrap;text-align:left">{fmt(num)}</td>'
+            '</tr></table></td></tr>')
+    return "".join(out)
+
+def weekly_columns(weeks, totals, color, height=92):
+    """Vertical bar chart: one column per ISO week, height proportional to commits.
+    Email-safe via a single table row of bottom-aligned cells holding a colored div."""
+    mx = max(totals) if totals else 0
+    if mx <= 0:
+        return '<div style="padding:10px 0;color:#889;font-size:13px">No commits in this window.</div>'
+    show_nums = len(weeks) <= 8
+    bars, labels = [], []
+    prev_month = None
+    for wk, t in zip(weeks, totals):
+        h = int(round(t / mx * height)) if t > 0 else 0
+        numtag = (f'<div style="font-size:10px;color:{MUTE};line-height:1;margin-bottom:2px">{t}</div>'
+                  if (show_nums and t > 0) else "")
+        bar = (f'{numtag}<div style="background:{color};height:{h}px;font-size:0;line-height:0;border-radius:2px 2px 0 0">&nbsp;</div>'
+               if h > 0 else '<div style="height:2px;background:'+LINE+';font-size:0;line-height:0">&nbsp;</div>')
+        bars.append(f'<td valign="bottom" style="vertical-align:bottom;padding:0 1px;text-align:center">{bar}</td>')
+        mon = week_monday(wk)
+        lab = ""
+        if (mon.year, mon.month) != prev_month:
+            lab = mon.strftime("%b"); prev_month = (mon.year, mon.month)
+        labels.append(f'<td style="font-size:9px;color:{MUTE};text-align:left;padding-top:4px;white-space:nowrap">{lab}</td>')
+    return ('<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed">'
+            f'<tr style="height:{height}px">{"".join(bars)}</tr>'
+            f'<tr>{"".join(labels)}</tr></table>'
+            f'<div style="font-size:11px;color:{MUTE};margin-top:6px">Commits per ISO week &middot; peak {mx} in a week</div>')
+
+def table_block(rows):
+    th = ('<th style="padding:7px 10px;border-bottom:2px solid '+LINE+';font-size:11px;color:'+MUTE+';'
+          'text-transform:uppercase;letter-spacing:.03em;{align}">{t}</th>')
+    head = (th.format(align="text-align:left", t="App") + th.format(align="text-align:right", t="Start")
+            + th.format(align="text-align:right", t="Latest") + th.format(align="text-align:right", t="Commits")
+            + th.format(align="text-align:right", t="Active days") + th.format(align="text-align:right", t="Lines changed")
+            + th.format(align="text-align:left", t="Repo"))
+    body = []
+    for m in rows:
+        url = "https://github.com/" + m["full"]
+        cell = 'padding:7px 10px;border-bottom:1px solid '+LINE+';font-size:13px'
+        body.append('<tr>'
+            f'<td style="{cell};text-align:left">{esc(m["name"])}</td>'
+            f'<td style="{cell};text-align:right;color:{MUTE}">{esc(m["first"])}</td>'
+            f'<td style="{cell};text-align:right;color:{MUTE}">{esc(m["last"])}</td>'
+            f'<td style="{cell};text-align:right">{fmt(m["commits"])}</td>'
+            f'<td style="{cell};text-align:right">{fmt(m["active_days"])}</td>'
+            f'<td style="{cell};text-align:right">{fmt(m["churn"])}</td>'
+            f'<td style="{cell};text-align:left"><a href="{esc(url)}" style="color:{TEAL};text-decoration:none">{esc(m["full"])}</a></td>'
+            '</tr>')
+    return ('<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse">'
+            f'<tr>{head}</tr>{"".join(body)}</table>')
+
+def section(title, win_start, win_end, color, repos):
+    weekset = weeks_in(win_start, win_end)
+    wk_index = {w: i for i, w in enumerate(weekset)}
+    active = []
+    for m in repos:
+        wc = win_commits(m, weekset)
+        if wc > 0:
+            active.append((m, wc))
+    # window totals (genuinely windowed via weekly buckets)
+    totals_by_week = [0] * len(weekset)
+    for m, _ in active:
+        for w, c in m["weekly"].items():
+            if w in wk_index: totals_by_week[wk_index[w]] += c
+    n = len(active)
+    commits = sum(wc for _, wc in active)
+    active_weeks = sum(1 for t in totals_by_week if t > 0)
+    busiest = max(totals_by_week) if totals_by_week else 0
+
+    cards = ('<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+             'style="width:100%;border-collapse:separate;border-spacing:10px 0;margin:0 -10px 4px"><tr>'
+             + card(fmt(n), "Repos active") + card(fmt(commits), "Commits")
+             + card(fmt(active_weeks), "Active weeks") + card(fmt(busiest), "Busiest week")
+             + '</tr></table>')
+
+    # timeline (chronological), commits-per-app (desc), both using windowed commit counts
+    gantt = sorted(active, key=lambda t: (t[0]["first"], t[0]["name"]))
+    gantt_data = [(m["name"], d(m["first"]), d(m["last"]), wc) for m, wc in gantt]
+    bars = sorted(active, key=lambda t: -t[1])
+    bar_data = [(m["name"], wc) for m, wc in bars]
+    tbl = sorted(active, key=lambda t: -t[1])
+
+    s = []
+    s.append(f'<h2 style="margin:34px 0 2px;font-size:19px;color:{NAVY}">{esc(title)}</h2>')
+    s.append(f'<div style="font-size:12px;color:{MUTE};margin-bottom:12px">'
+             f'Window {win_start.date().isoformat()} &rarr; {win_end.date().isoformat()}. '
+             'Commit counts below are for this window; the table shows lifetime totals.</div>')
+    s.append(cards)
+    s.append(panel("Timeline", "bar = first&rarr;latest commit (clamped to window), number = commits",
+                   '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse">'
+                   + gantt_rows(gantt_data, win_start, win_end, color) + '</table>'))
+    s.append(panel("Weekly effort", "commits across all repos, per ISO week",
+                   weekly_columns(weekset, totals_by_week, color)))
+    s.append(panel("Commits per app", "in this window",
+                   '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse">'
+                   + hbar_rows(bar_data, color) + '</table>'))
+    s.append(panel("Repos", "lifetime totals", table_block([m for m, _ in tbl])))
+    return "".join(s)
+
+def render_html(repos, now_str, today=None):
+    if today is None: today = datetime.utcnow()
+    sec30 = section("Last 30 days",  today - timedelta(days=30),  today, NAVY, repos)
+    sec365 = section("Last 12 months", today - timedelta(days=365), today, TEAL, repos)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>App Portfolio Dashboard</title></head>
+<body style="margin:0;padding:0;background:#f4f6fb">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;background:#f4f6fb"><tr><td align="center" style="padding:0">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:700px;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:{INK}"><tr><td style="padding:0 16px 40px">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;background:{NAVY};border-radius:0 0 12px 12px;margin-bottom:6px"><tr><td style="padding:20px 22px">
+<div style="color:#ffffff;font-size:21px;font-weight:700">App Portfolio Dashboard</div>
+<div style="color:#c7d2e8;font-size:12px;margin-top:4px">Last updated {esc(now_str)} &middot; built in GitHub Actions from your repos</div>
+</td></tr></table>
+<div style="font-size:13px;color:{MUTE};margin:14px 2px 0;line-height:1.5">Showing the <b>last 30 days</b> first, then the <b>last 12 months</b>. Cards, charts and timeline numbers are windowed; the repo tables list lifetime totals (matching data.csv). A repo appears in a window only if it had a commit during it.</div>
+{sec30}
+{sec365}
+<div style="color:#889;font-size:12px;margin-top:30px;line-height:1.6;border-top:1px solid {LINE};padding-top:14px">Auto-generated in GitHub Actions. Forks, archived repos and vendored libraries are excluded; new repos are picked up automatically. Charts are plain HTML so they render inside email.</div>
+</td></tr></table>
+</td></tr></table>
+</body></html>"""
 
 def build():
     if not TOKEN:
@@ -165,60 +312,18 @@ def build():
     if not repos:
         print("ERROR: no repos with history found"); sys.exit(1)
     repos.sort(key=lambda m: m["first"])
-    tl,heat = render(repos)
-    open(os.path.join(OUT,"timeline.png"),"wb").write(base64.b64decode(tl))
-    if heat: open(os.path.join(OUT,"weekly.png"),"wb").write(base64.b64decode(heat))
-    # csv
+    now=datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
+    # csv (lifetime totals — unchanged schema)
     with open(os.path.join(OUT,"data.csv"),"w",newline="") as f:
         w=csv.writer(f); w.writerow(["app","first_commit","last_commit","commits","active_days","insertions","deletions","churn","repo"])
         for m in repos: w.writerow([m["name"],m["first"],m["last"],m["commits"],m["active_days"],m["insertions"],m["deletions"],m["churn"],m["full"]])
-    # html
-    tot_c=sum(m["commits"] for m in repos); tot_a=sum(m["active_days"] for m in repos); tot_ch=sum(m["churn"] for m in repos)
-    starts=[m["first"] for m in repos]; lasts=[m["last"] for m in repos]
-    now=datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-    rows=json.dumps([{"name":m["name"],"first":m["first"],"last":m["last"],"commits":m["commits"],
-        "active":m["active_days"],"churn":m["churn"],"full":m["full"]} for m in repos])
-    heatpanel = ('<div class="panel"><h2>Weekly effort</h2><img src="data:image/png;base64,'+heat+'"></div>') if heat else ""
-    html=TEMPLATE.replace("__NOW__",now).replace("__N__",str(len(repos))).replace("__C__",f"{tot_c:,}")\
-        .replace("__A__",f"{tot_a:,}").replace("__CH__",f"{tot_ch:,}").replace("__LO__",min(starts)).replace("__HI__",max(lasts))\
-        .replace("__TL__",tl).replace("__HEAT__",heatpanel).replace("__ROWS__",rows)
-    with open(os.path.join(OUT,"dashboard.html"),"w",encoding="utf-8") as f: f.write(html)
+    # html (e-mail-safe; rendered inline by the workflow's html_body)
+    htmlout = render_html(repos, now)
+    with open(os.path.join(OUT,"dashboard.html"),"w",encoding="utf-8") as f: f.write(htmlout)
     # privacy-safe log: counts only, no names
+    tot_c=sum(m["commits"] for m in repos); tot_a=sum(m["active_days"] for m in repos); tot_ch=sum(m["churn"] for m in repos)
     print(json.dumps({"repos":len(repos),"commits":tot_c,"active_days":tot_a,"churn":tot_ch,"updated":now}))
-
-TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>App Portfolio Dashboard</title>
-<style>*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1a2233;background:#f4f6fb}
-header{background:#1f3864;color:#fff;padding:22px 30px}header h1{margin:0;font-size:22px}header .sub{opacity:.8;font-size:13px;margin-top:4px}
-.wrap{max-width:1200px;margin:0 auto;padding:24px 30px 60px}.cards{display:flex;gap:16px;flex-wrap:wrap;margin:20px 0}
-.card{background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);flex:1;min-width:150px}
-.card .v{font-size:28px;font-weight:700;color:#1f3864}.card .l{font-size:12px;color:#667;text-transform:uppercase;letter-spacing:.04em;margin-top:4px}
-.panel{background:#fff;border-radius:12px;padding:18px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin:18px 0}
-.panel h2{margin:0 0 12px;font-size:16px}.panel img{width:100%;height:auto;border-radius:6px}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px 10px;border-bottom:1px solid #eef0f4;text-align:right}
-th:first-child,td:first-child{text-align:left}th{cursor:pointer;color:#445;user-select:none;background:#fafbfe}th:hover{color:#1f3864}
-tr:hover td{background:#fafbfe}a{color:#2c7fb8;text-decoration:none}.foot{color:#889;font-size:12px;margin-top:24px;line-height:1.5}</style></head><body>
-<header><h1>App Portfolio Dashboard</h1><div class="sub">Last updated __NOW__ · built in GitHub Actions from your repos</div></header>
-<div class="wrap"><div class="cards">
-<div class="card"><div class="v">__N__</div><div class="l">Apps</div></div>
-<div class="card"><div class="v">__C__</div><div class="l">Commits</div></div>
-<div class="card"><div class="v">__A__</div><div class="l">Active days</div></div>
-<div class="card"><div class="v">__CH__</div><div class="l">Lines changed</div></div>
-<div class="card"><div class="v" style="font-size:15px">__LO__<br>→ __HI__</div><div class="l">Span</div></div></div>
-<div class="panel"><h2>Timeline</h2><img src="data:image/png;base64,__TL__"></div>
-__HEAT__
-<div class="panel"><h2>All apps <span style="font-weight:400;color:#889;font-size:12px">(click a header to sort)</span></h2>
-<table id="t"><thead><tr><th data-k="name">App</th><th data-k="first">Start</th><th data-k="last">Latest</th>
-<th data-k="commits">Commits</th><th data-k="active">Active days</th><th data-k="churn">Lines changed</th><th data-k="full">Repo</th></tr></thead><tbody></tbody></table></div>
-<div class="foot">Auto-generated in GitHub Actions. Forks, archived repos and vendored libraries are excluded; new repos are picked up automatically.</div></div>
-<script>var DATA=__ROWS__;function fmt(n){return n.toLocaleString()}
-function render(rows){var b=document.querySelector("#t tbody");b.innerHTML="";
-rows.forEach(function(r){var tr=document.createElement("tr");
-tr.innerHTML='<td>'+r.name+'</td><td>'+r.first+'</td><td>'+r.last+'</td><td>'+fmt(r.commits)+'</td><td>'+fmt(r.active)+'</td><td>'+fmt(r.churn)+'</td><td style="text-align:left">'+r.full+'</td>';
-b.appendChild(tr);});}
-var dir={};document.querySelectorAll("#t th").forEach(function(th){th.onclick=function(){var k=th.dataset.k;dir[k]=!dir[k];var s=dir[k]?1:-1;
-DATA.sort(function(a,b){var x=a[k],y=b[k];if(typeof x==="string"){return s*x.localeCompare(y)}return s*(x-y)});render(DATA);};});
-render(DATA);</script></body></html>"""
 
 if __name__=="__main__":
     build()
+# end

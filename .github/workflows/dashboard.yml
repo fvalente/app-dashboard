@@ -35,6 +35,10 @@ jobs:
         run: python build_ci.py
 
       # ---------- DELIVERY: email (private) ----------
+      # The dashboard renders INLINE in the email body (html_body). The HTML is
+      # written to be Gmail-safe (no JS / no base64 images / no SVG), so it shows
+      # up directly in the message. dashboard.html + data.csv are also attached
+      # as a fallback / for the raw figures.
       - name: Email the dashboard
         uses: dawidd6/action-send-mail@v3
         with:
@@ -46,10 +50,11 @@ jobs:
           to: ${{ secrets.MAIL_TO }}               # where to send (can be your gmail)
           from: App Dashboard <${{ secrets.MAIL_USERNAME }}>
           subject: "📊 App portfolio dashboard — auto-update"
+          html_body: file://output/dashboard.html  # renders the dashboard in the email body
           body: |
             Your app portfolio dashboard has been rebuilt.
-            Open the attached dashboard.html in any browser. Raw figures are in data.csv.
-          attachments: output/dashboard.html,output/data.csv,output/timeline.png,output/weekly.png
+            If your mail client can't show HTML, open the attached dashboard.html. Raw figures are in data.csv.
+          attachments: output/dashboard.html,output/data.csv
 
       # ---------- DELIVERY ALTERNATIVE: push to a SEPARATE PRIVATE repo ----------
       # Prefer this over email if you'd rather browse it on GitHub (private Pages needs GitHub Pro).
